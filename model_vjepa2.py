@@ -291,6 +291,13 @@ def rotate_queries_or_keys(x, pos):
 
 	return (x * emb_cos) + (y * emb_sin)
 
+"""
+
+Implements self-attention mechanism that incorporates Rotary Positional Embeddings (RoPE). Special attention
+layer for the VJEPA2 mdoel, designed for video data.
+
+"""
+
 class VJEPA2RopeAttention(nn.Module):
 	def __init__(
 			self, 
@@ -311,7 +318,7 @@ class VJEPA2RopeAttention(nn.Module):
 		
 		self.attention_head_size = int(hidden_size / num_attention_heads)
 		self.all_head_size = self.num_attention_heads * self.attention_head_size
-
+		# Linear Projection: Projects input, hidden_size to all_head_size for queries, keys, and values
 		self.query = nn.Linear(hidden_size, self.all_head_size, bias=config.qkv_bias)
 		self.key = nn.Linear(hidden_size, self.all_head_size, bias=config.qkv_bias)
 		self.value = nn.Linear(hidden_size, self.all_head_size, bias=config.qkv_bias)
@@ -319,10 +326,19 @@ class VJEPA2RopeAttention(nn.Module):
 		self.proj = nn.Linear(hidden_size, hidden_size)
 		self.dropout_prob = config.attention_probs_dropout_prob
 		self.dropout = nn.Dropout(self.dropout_prob)
-
+		# Number of patches along height/width.
 		self.grid_size = self.config.crop_size // self.config.patch_size
+		# Number of tubelets alogn temporal dimension.
 		self.grid_depth = self.config.frames_per_clip // self.config.tubelet_size
+		"""
+		How attention_head_size is split to apply RoPE independently across
 
+			1. Depth
+			2. Height
+			3. Width
+
+		roughly 1/3 of the head dim
+		"""
 		self.d_dim = int(2 * ((self.attention_head_size // 3) // 2))
 		self.h_dim = int(2 * ((self.attention_head_size // 3) // 2))
 		self.w_dim = int(2 * ((self.attention_head_size // 3) // 2))
@@ -330,6 +346,8 @@ class VJEPA2RopeAttention(nn.Module):
 		self.scaling = self.attention_head_size**-0.5
 		self.is_causal = False
 	
+	# Reshape the query, key or value tensors from (batch_size, sequence_lenth, all_head_size) to
+	# (batch_size, num_attention_heads, sequence_length, attention_head_size)
 	def transpose_for_scores(self, x: torch.Tensor) -> torch.Tensor:
 		new_x_shape = x.size()[:-1] + (
 			self.num_attention_heads,
@@ -338,6 +356,8 @@ class VJEPA2RopeAttention(nn.Module):
 		x = x.view(new_x_shape)
 		return x.permute(0, 2, 1, 3)
 	
+	# Extract frame (depth) and height components of a given 1D token ID, assuming a flattened 3D grid of patches.
+	# Reverse the flattening process to get the 3D coordinates
 	def _get_frame_pos(self, ids):
 		tokens_per_frame = int(self.grid_size * self.grid_size)
 		return ids // tokens_per_frame
@@ -351,6 +371,10 @@ class VJEPA2RopeAttention(nn.Module):
 		tokens_per_row = self.grid_size
 		return ids // tokens_per_row
 	
+	# Calculates the 3D positional IDs (frame, height, width) for each token.
+	# Assumes sequential arrangement.
+	# Decomposes the 1D token index into its 3D coordinates based on the grid_size and 
+	# tokens_per_frame. Essential for applying 3D RoPE
 	def get_position_ids(self, x, masks=None):
 		device = x.device
 		token_size = x.size(1)
@@ -373,11 +397,15 @@ class VJEPA2RopeAttention(nn.Module):
 		# Remove frame component from ids (1st term) and height component (2nd term)
 		width_ids = (ids - tokens_per_frame * frame_ids) - tokens_per_row * height_ids
 		return frame_ids, height_ids, width_ids
-	
+	"""
+	Applies rotate_queries_or_keys function to different parts of the query/key vector
+	"""
 	def apply_rotary_embeddings(self, qk, pos_ids):
+		# Unpacks the 3D positional IDs.
 		d_mask, h_mask, w_mask = pos_ids
 		s = 0
 
+		# Slices the qk tensor based on self.d_dim, self.h_dim, self.w_dim and applies rotate_queries_or_keys to each slice
 		qkd = rotate_queries_or_keys(qk[..., s : s + self.d_dim], pos=d_mask)
 		s += self.d_dim
 		qkh = rotate_queries_or_keys(qk[..., s : s + self.h_dim], pos=h_mask)
@@ -393,6 +421,22 @@ class VJEPA2RopeAttention(nn.Module):
 			qk = torch.cat([qkd, qkh, qkw], dim=-1)
 		return qk
 
+	"""
+	mixed_query_layer = self.query(hidden_states): Computes raw queries.
+
+	Computes and reshapes keys.
+
+	key_layer = self.transpose_for_scores(self.key(hidden_states)) 
+	value_layer = self.transpose_for_scores(self.value(hidden_states))
+	query_layer = self.transpose_for_scores(mixed_query_layer)
+
+	
+	Apply RoPE.
+
+	pos_ids = self.get_position_ids(hidden_states, masks=position_mask): Gets the 3D positional IDs
+	key_layer = self.apply_rotary_embeddings(key_layer, pos_ids): Applies RoPE to the key vectors
+	query_layer = self.apply_rotary_embeddings(query_layer, pos_ids): Applies RoPE to the query vectors
+	"""
 	def forward(
 			self, 
 			hidden_states,
@@ -410,6 +454,7 @@ class VJEPA2RopeAttention(nn.Module):
 		key_layer = self.apply_rotary_embeddings(key_layer, pos_ids)
 		query_layer = self.apply_rotary_embeddings(query_layer, pos_ids)
 
+		# Scaled Dot Product Attention often doesn't expose attention weights directly.
 		attention_inference: Callable = eager_attention_forward
 		if self.config._attn_implementation != "eager":
 			if self.config._attn_implementation == "sdpa" and output_attentions:
@@ -420,6 +465,7 @@ class VJEPA2RopeAttention(nn.Module):
 			else:
 				attention_inference = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
 
+			# Attention Calculation: calls selected attention function with prepared queries, keys, values, head mask and other paraments
 			context_layer, attention_probs = attention_inference(
 				self, 
 				query_layer,
@@ -430,11 +476,18 @@ class VJEPA2RopeAttention(nn.Module):
 				scaling=self.scaling,
 				dropout=0.0 if not self.training else self.dropout_prob
 			)
-
+			# Reshapes attention output: (batch_size, num_heads, sequence_length, head_dim) -> (batch_size, sequence_length, all_head_size)
 			new_context_layer_shape = context_layer.size()[:-2] + (self.all_head_size,)
+			# Applies the final linear projection
 			context_layer = self.proj(context_layer.reshape(new_context_layer_shape))
 
 			outputs = (context_layer, attention_probs) if output_attentions else (context_layer,)
 
 			return outputs
 
+"""
+^^^ Attention layer that takes patch embeddings, calculates their 3D positions, 
+applies Rotary Positional Embeddings to queries adn keys to incorporate spatial 
+and temporal relationships, performs multi-head scaled dot-product attention, 
+and the projects the output. Ensures positional awareness crucial for video processing.
+"""
