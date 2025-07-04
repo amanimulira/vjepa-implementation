@@ -188,5 +188,253 @@ class VJEPA2Embeddings(nn.Module):
 
 		return embeddings
 	
+"""
 
+Utility function for performing multi-head self-attention in an "eager" fashion.
+
+"""
+def eager_attention_forward(
+		module: nn.Module,
+		query: torch.Tensor,
+		key: torch.Tensor,
+		value: torch.Tensor,
+		attention_mask: Optional[torch.Tensor],
+		scaling: float,
+		dropout: float = 0.0,
+		**kwargs,
+):
+	# Take the dot product between "query" and "key" to get the raw attention scores.
+	# Transpose last 2 dims; perform batch matrix multiplication between query and transposed key.
+	# Result represents raw attention scores for each head, where matrix indicates how much each
+	# token in the query attends to each token in the key. Then scale.
+	attn_weights = torch.matmul(query, key.transpose(-1, -2)) * scaling
+
+	# Normalize the attention scores to probs.
+	# Applies the softmax function along the last dimension. Normalizing the score so they sum to 1.
+	attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
+
+	# This is actually dropping out entire tokens to attend to, which might
+	# seem a bit unusal, byt is taken from the original Transformer paper.
+	attn_weights = nn.functional.dropout(attn_weights, p=dropout, trainig=module.training)
+
+	# Mask heads if we want...
+	# Applied to the attention weights: where prevents attention to those positions.
+	if attention_mask is not None:
+		attn_weights = attn_weights * attention_mask
+
+	attn_output = torch.matmul(attn_weights, value)
+	# Ensures memory layout of the tensor is contiguous after transpose operation
+	attn_output = attn_output.transpose(1, 2).contiguous()
+
+	return attn_output, attn_weights
+
+
+# RoPE type of positional encoding that encodes relative positional information into the self-attention mechanism
+# How? By rotating the query and key vectors.
+
+"""
+
+Takes input, typically query or key vectors from attention layer.
+
+Tensor represents positional indices for each token.
+
+"""
+def rotate_queries_or_keys(x, pos):
+	# Extracts batch size, number of attention heads, sequence length and head dimension from the tensor x.
+	B, num_heads, N, D = x.size()
+
+	"""
+	like inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=torch.float) / dim))
+	computed every time. instead HF style is to compute the inv_freq once and store it
+	-- compute angle for each position.
+	"""
+
+	# Calculate Angualar Frequencies
+	omega = torch.arange(D // 2, dtype=x.dtype, device=x.device)
+	omega /= D / 2.0
+	omega = 1.0 / 10000**omega # (D/2, )
+	# Outer product between the pos, positional indices and omega, angular frequencies
+	# Einstein summation operation
+	freq = torch.einsum("..., f -> ... f", pos, omega) # (..., N, D/2), outer product
+
+	# -- build rotation matrix and apply
+	emb_sin = freq.sin() # (..., N, D/2)
+	emb_cos = freq.cos() # (..., N, D/2)
+
+	# Duplicates the last dim, as RoPE applies pairs of dim
+	# i.e. (x0, x1) rotated by theta -> (x0*cos(theta) - x1*sin(theta), x0*sin(theta) + x1*cos(theta))
+	emb_sin = emb_sin.squeeze(-1).repeat(1, 1, 1, 2)
+	emb_cos = emb_cos.squeeze(-1).repeat(1, 1, 1, 2)
+	"""
+
+	1. x.unflatten(-1, (-1, 2)): reshapes last dim D of x into (D/2, 2). Grouping elements into pairs
+
+	2. y.unbind(dim=-1): splits (D/2, 2) dim into two separate tensors, y1 (containing x0, x2, ...)
+	and y2 (containing x1, x3, ...)
+
+	3. torch.stack((-y2, y1), dim=-1): creates rotated components. for pair (a, b), the rotated pair 
+	becomes (a*cos - b*sin, a*sin + b*cos). y here represents the (-b, a) part of the rotation.
+
+	4. y.flatten(-2): Flattens the (D/2, 2) back to D.
+
+	5. returns (x * emb_cos) + (y * emb_sin): final rotation formula.
+
+	[ cos(theta)  -sin(theta) ] [ x0 ]   = [ x0*cos(theta) - x1*sin(theta) ]
+	[ sin(theta)   cos(theta) ] [ x1 ]     [ x0*sin(theta) + x1*cos(theta) ]
+
+	"""
+	y = x.unflatten(-1, (-1, 2))
+	y1, y2 =y.unbid(dim=-1)
+
+	y = torch.stack((-y2, y1), dim=-1)
+	y = y.flatten(-2)
+
+	return (x * emb_cos) + (y * emb_sin)
+
+class VJEPA2RopeAttention(nn.Module):
+	def __init__(
+			self, 
+			config: VJEPA2Config,
+			hidden_size: int = 1024,
+			num_attention_heads: int = 16,
+	):
+		super().__init__()
+		self.config = config
+		self.hidden_size = hidden_size
+		self.num_attention_heads = num_attention_heads
+
+		if hidden_size % num_attention_heads != 0:
+			raise ValueError(
+				f"The hidden size {(hidden_size)} is not a multiple of the number of attention "
+				f"heads {num_attention_heads}"
+			)
+		
+		self.attention_head_size = int(hidden_size / num_attention_heads)
+		self.all_head_size = self.num_attention_heads * self.attention_head_size
+
+		self.query = nn.Linear(hidden_size, self.all_head_size, bias=config.qkv_bias)
+		self.key = nn.Linear(hidden_size, self.all_head_size, bias=config.qkv_bias)
+		self.value = nn.Linear(hidden_size, self.all_head_size, bias=config.qkv_bias)
+
+		self.proj = nn.Linear(hidden_size, hidden_size)
+		self.dropout_prob = config.attention_probs_dropout_prob
+		self.dropout = nn.Dropout(self.dropout_prob)
+
+		self.grid_size = self.config.crop_size // self.config.patch_size
+		self.grid_depth = self.config.frames_per_clip // self.config.tubelet_size
+
+		self.d_dim = int(2 * ((self.attention_head_size // 3) // 2))
+		self.h_dim = int(2 * ((self.attention_head_size // 3) // 2))
+		self.w_dim = int(2 * ((self.attention_head_size // 3) // 2))
+
+		self.scaling = self.attention_head_size**-0.5
+		self.is_causal = False
+	
+	def transpose_for_scores(self, x: torch.Tensor) -> torch.Tensor:
+		new_x_shape = x.size()[:-1] + (
+			self.num_attention_heads,
+			self.attention_head_size,
+		)
+		x = x.view(new_x_shape)
+		return x.permute(0, 2, 1, 3)
+	
+	def _get_frame_pos(self, ids):
+		tokens_per_frame = int(self.grid_size * self.grid_size)
+		return ids // tokens_per_frame
+	
+	def _get_height_pos(self, ids):
+		# Remove frame component form ids
+		tokens_per_frame = int(self.grid_size * self.grid_size)
+		frame_ids = self._get_frame_pos(ids)
+		ids = ids - tokens_per_frame * frame_ids
+
+		tokens_per_row = self.grid_size
+		return ids // tokens_per_row
+	
+	def get_position_ids(self, x, masks=None):
+		device = x.device
+		token_size = x.size(1)
+
+		# Note: when masks is none, we use a 1d id instead of Bxnum_attention_heads mask,
+		# as 1d vector is breadcasted to the correct shapes.
+
+		if masks is not None:
+			ids = masks.unsqueeze(1).repeat(1, self.num_attention_heads, 1)
+		else:
+			ids = torch.arange(token_size, device=device)
+		
+		# Change to allow for extrapolation
+		tokens_per_frame = int(self.grid_size * self.grid_size)
+		frame_ids = self._get_frame_pos(ids)
+
+		tokens_per_row = self.grid_size
+		height_ids = self._get_height_pos(ids)
+
+		# Remove frame component from ids (1st term) and height component (2nd term)
+		width_ids = (ids - tokens_per_frame * frame_ids) - tokens_per_row * height_ids
+		return frame_ids, height_ids, width_ids
+	
+	def apply_rotary_embeddings(self, qk, pos_ids):
+		d_mask, h_mask, w_mask = pos_ids
+		s = 0
+
+		qkd = rotate_queries_or_keys(qk[..., s : s + self.d_dim], pos=d_mask)
+		s += self.d_dim
+		qkh = rotate_queries_or_keys(qk[..., s : s + self.h_dim], pos=h_mask)
+		s += self.h_dim
+		qkw = rotate_queries_or_keys(qk[..., s : s + self.w_dim], pos=w_mask)
+		s += self.w_dim
+
+		# combine rotated dimension
+		if s < self.attention_head_size:
+			qkr = qk[..., s:]
+			qk = torch.cat([qkd, qkh, qkw, qkr], dim=-1)
+		else:
+			qk = torch.cat([qkd, qkh, qkw], dim=-1)
+		return qk
+
+	def forward(
+			self, 
+			hidden_states,
+			position_mask: Optional[torch.Tensor] = None,
+			output_attentions: bool = False,
+			head_mask: Optional[torch.Tensor] = None,
+	) -> Union[tuple[torch.Tensor, torch.Tensor], tuple[torch.Tensor]]:
+		mixed_query_layer = self.query(hidden_states)
+
+		key_layer = self.transpose_for_scores(self.key(hidden_states))
+		value_layer = self.transpose_for_scores(self.value(hidden_states))
+		query_layer = self.transpose_for_scores(mixed_query_layer)
+
+		pos_ids = self.get_position_ids(hidden_states, masks=position_mask)
+		key_layer = self.apply_rotary_embeddings(key_layer, pos_ids)
+		query_layer = self.apply_rotary_embeddings(query_layer, pos_ids)
+
+		attention_inference: Callable = eager_attention_forward
+		if self.config._attn_implementation != "eager":
+			if self.config._attn_implementation == "sdpa" and output_attentions:
+				logger.warning_once(
+					"`torch.nn.funcitonal.scaled_dot_product_attention` does not support `output_attentions=True`. Falling back to "
+					'eager attention. This warning can be removed using the argument `attn_implementation="eager"` when loading the model.'
+				)
+			else:
+				attention_inference = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
+
+			context_layer, attention_probs = attention_inference(
+				self, 
+				query_layer,
+				key_layer, 
+				value_layer, 
+				head_mask, 
+				is_casual=self.is_causal,
+				scaling=self.scaling,
+				dropout=0.0 if not self.training else self.dropout_prob
+			)
+
+			new_context_layer_shape = context_layer.size()[:-2] + (self.all_head_size,)
+			context_layer = self.proj(context_layer.reshape(new_context_layer_shape))
+
+			outputs = (context_layer, attention_probs) if output_attentions else (context_layer,)
+
+			return outputs
 
