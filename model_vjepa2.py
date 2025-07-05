@@ -636,16 +636,20 @@ class VJEPA2Layer(GradientCheckpointingLayer):
 
 		return outputs
 
+
+# Main encoder, takes input video data and transforms it into rich, contexturalized representations.
+# How? Stacks multiple VJEPA2Layer blocks
 class VJEPA2Encoder(nn.Module):
 	def __init__(self, config: VJEPA2Config):
 		super().__init__()
 		self.config = config
-
+		# Turns raw video pixels values into a seqence of patch embeddings
 		self.embeddings = VJEPA2Embeddings(config, hidden_size=config.hidden_size)
 		drop_path_rates = [
 			(config.drop_path_rate * i / (config.num_hidden_layers - 1) if config.num_hidden_layers > 1 else 0.0)
 			for i in range(config.num_hidden_layers)
 		]
+		# Transformer layers: VJEPA2Layer instantiated for each i in range
 		self.layer = nn.ModuleList(
 			[
 				VJEPA2Layer(
@@ -660,7 +664,7 @@ class VJEPA2Encoder(nn.Module):
 		)
 		self.layernorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norms_eps)
 		self.gradient_checkpointing = False
-
+	# Can return either a ModelOutput object or plain tuple
 	@can_return_tuple
 	def forward(
 		self, 
@@ -673,20 +677,24 @@ class VJEPA2Encoder(nn.Module):
 		all_self_attentions = () if output_attentions else None
 
 		hidden_states = self.embeddings(pixel_value_videos)
-
+		# Iterate through layers
 		for i, layer_module in enumerate(self.layer):
+			# Collected Hidden States; if true hidden_states before current layer's computations are added to all_hidden_states tuple.
 			if output_hidden_states:
 				all_hidden_states = all_hidden_states + (hidden_states,)
-
+			# If Not None: specific mask for the current layer i extracted.
 			layer_head_mask = head_mask[i] if head_mask is not None else None
+			# Hidden_States pass throug current VJEPA2Layer. 
+			# position_mask argument None as the positional information handled by PoPE within VJEPA2RopeAttention
 			layer_outputs = layer_module(hidden_states, None, layer_head_mask, output_attentions)
+			# Update hidden_states -> first element of layer_outputs processed hidden_states, which becomes the input for the next layer.
 			hidden_states = layer_outputs[0]
-
+			# Collect attentions if requested
 			if output_attentions:
 				all_self_attentions = all_self_attentions + (layer_outputs[1],)
-
+			# Layer normalization
 			hidden_states = self.layernorm(hidden_states)
-
+			# Collect Last Hidden State if requested
 			if output_hidden_states:
 				all_hidden_states = all_hidden_states + (hidden_states,)
 
@@ -695,7 +703,325 @@ class VJEPA2Encoder(nn.Module):
 				hidden_states=all_hidden_states,
 				attentions=all_self_attentions,
 			)
+
+"""
+Selects and extracts specific tokens from a batch of tensors based on prvided masks.
+"""
+def apply_masks(tensor: torch.Tensor, masks: list[torch.Tensor]) -> torch.Tensor:
+	"""
+	initializes empty list - to store tensors after applying each mask.
+	iterates through each mask, given in input masks list.
+
+		- .unsqueeze(-1): adds new dim of size 1 at end of mask tensor.
+		- .repeat(1, 1, tensor.size(-1)): repeats expanded mask across last dim.
+			torch.gather expects the index tensor to have the same number of dim as the inptu tensor
+	
+	all_masked_tensor - where actual masking/selection happens
+
+		- torch.gather: gathers values along a specified dim. for each element in mask_keep uses value as an index
+			to select element from the tensor along dim=1.
+	
+	returns torch.cat - all tensors collected concatenated along the batch dim
+
+		- if you have N masks, and each masked tensor has batch size B', final output tensor will have a batch size of N * B'
+
+	Good for self-supervised learnign where multiple masked views of the same batch are often created and processed together.
+	"""
+	all_masked_tensors = []
+	for mask in masks:
+		mask = mask.to(tensor.device)
+		mask_keep = mask.unsqueeze(-1).repeat(1, 1, tensor.size(-1))
+		all_masked_tensors += [torch.gather(tensor, dim=1, index=mask_keep)]
+
+	return torch.cat(all_masked_tensors, dim=0)
+
+# Prepares the input embeddings for the predictor module in VJEPA2 architecture
+# Combines context ( visible ) tokens form encoder with learnable mask tokens to represent the hidden ( masked ) regions.
+class VJEPA2PredictorEmbeddings(nn.Module):
+	# Construct mask token, position and patch embeddings.
+
+	def __init__(self, config: VJEPA2Config):
+		super().__init__()
+		
+		self.config = config
+		self.predictor_embeddings = nn.Linear(config.hidden_size, config.pred_hidden_size)
+		self.num_mask_tokens = 0
+		self.zero_init_mask_tokens = config.pred_zero_init_mask_tokens
+		# Stores number of unique mask tokens the predictor will use. Learnable embeddings that represent the "empty" or "unknown" masked patches.
+		self.num_mask_tokens = config.pred_num_mask_tokens 
+		# nn.Parameter, mask tokens are learnable weights.
+		# Initalized with torch.zeros tensor.
+		self.mask_tokens = nn.Parameter(torch.zeros(self.num_mask_tokens, 1, 1, config.pred_hidden_size))
+
+		self.patch_size = config.patch_size
+		self.config = config
+
+	# Calculates total number of patches, but handles the case where frames_per_clip is 1 else claculates patches for 3D video.
+	@staticmethod
+	def num_patches(config):
+		if config.frames_per_clip > 1:
+			return (
+				(config.frames_per_clip // config.tubelet_size)
+				* (config.crop_size // config.patch_size)
+				* (config.crop_size // config.patch_size)
+			)
+		else:
+			return (config.crop_size // config.patch_size) * (config.crop_size // config.patch_size)
+		
+	def forward(
+			self, 
+			hidden_states: torch.Tensor,
+			context_mask: list[torch.Tensor],
+			target_mask: list[torch.Tensor],
+			mask_index: int = 1,
+	) -> tuple[torch.Tensor, torch.Tensor]:
+		
+		B = hidden_states.size(0) # batch size
+		context = self.predictor_embeddings(hidden_states) # projects encoders hidden_size into the predictors pred_hidden_size.
+
+		# Make target tokens
+		mask_index = mask_index % self.num_mask_tokens
+		# Sinlge token used to represent all masked patches for the current operation
+		target = self.mask_tokens[mask_index]
+		"""
+
+		reshape and repeat target:
+
+			- max_patch_num = target_mask[0].max() + 1, determine necessary sequence length for target tokens.
+				takes max index present in first target_mask in list and adds 1. adjusting target tensors length
+				to match actual masked regions in the current batch.
+
+			- target = target.repeat(B, max_patch_num, 1), single selected mask token repeated B times for the batch dim and max_patch_num
+				times for the sequence length dim. every potential masked position is filled with same generic mask token.
 			
+			- target = apply_masks(target, target_mask), selects only the specific target tokens indicated by target_mask.
+				output is a tensor containing only the mask tokens relevant to the current masked positions
+
+		"""
+		max_patch_num = target_mask[0].max() + 1 
+		target = target.repeat(B, max_patch_num, 1)
+		target = apply_masks(target, target_mask)
+
+		"""
+		
+		concatenate context & target tokens:
+
+			- context = context.repeat(len(context_mask), 1, 1), if theres multiple context_mask elements, e.g. from multiple masked views
+				the context tensor is duplicated to match the effective batch size after apply_masks.
+			
+			- embeddings = torch.cat([context, target], dim=1), concatenates processed context tokens and target (mask) tokens 
+				alogn the sequence length dim. This creates a combined sequence of visible and masked tokens.
+ 
+		"""
+		context = context.repeat(len(context_mask), 1, 1)
+		embeddings = torch.cat([context, target], dim=1)
+
+		"""
+		
+		positions of context & target tokens:
+
+			- cm = torch.cat(context_mask, dim=0), concatenates all context mask along the batch dim.
+
+			- tm = torch.cat(target_mask, dim=0), concatenates all target mask along the batch dim.
+
+			- masks = torch.cat([cm, tm], dim=1), concatenates context and target mask along the sequence length dim
+		
+		"""
+		cm = torch.cat(context_mask, dim=0)
+		tm = torch.cat(target_mask, dim=0)
+		masks = torch.cat([cm, tm], dim=1)
+
+		return embeddings, masks
+
+class VJEPA2Predictor(nn.Module):
+	def __init__(self, config: VJEPA2Config):
+		super().__init__()
+		self.config = config
+		self.gradient_checkpointing = False
+		self.embeddings = VJEPA2PredictorEmbeddings(config)
+		drop_path_rates = [
+			(
+				config.drop_path_rate * i / (config.pred_num_hidden_layers - 1)
+				if config.pred_num_hidden_layers > 1
+				else 0.0
+			)
+			for i in range(config.pred_num_hidden_layers)
+		]
+		self.layer = nn.ModuleList(
+			[
+				VJEPA2Layer(
+					config,
+					drop_path_rate=drop_path_rates[i],
+					hidden_size=config.pred_hidden_size,
+					num_attention_heads=config.pred_num_attention_heads,
+					mlp_ratio=config.pred_mlp_ratio,
+				)
+				for i in range(config.pred_num_hidden_layers)
+			]
+		)
+		self.layernorm = nn.LayerNorm(config.pred_hidden_size, eps=config.layer_norm_eps)
+		self.proj = nn.Linear(config.pred_hidden_size, config.hidden_size, bias=True)
+
+	def sort_tokens(self, hidden_states, position_masks, argsort, head_mask=None):
+		# gather position masks
+		argsort = argsort.to(position_masks.device)
+		position_masks = torch.gather(position_masks, dim=1, index=argsort)
+
+		# gather hidden states
+		argsort = argsort.to(hidden_states.device)
+		hidden_states_argsort = argsort.unsqueeze(-1).expand(-1, -1, hidden_states.size(-1))
+		hidden_states = torch.gather(hidden_states, dim=1, index=hidden_states_argsort)
+
+		# gather head mask
+		if head_mask is not None and head_mask[0] is not None:
+			argsort = argsort.to(head_mask.device)
+			head_mask = head_mask.permute(1, 0, 2, 3, 4)
+			argsort_4d = (
+				argsort.unsqueeze(1)
+				.unsqueeze(1)
+				.expand(-1, head_mask.size(1), head_mask.size(2), -1)
+				.unsqueeze(-1)
+				.expand(-1, -1, -1, -1, head_mask.size(-1))
+			)
+			head_mask = torch.gather(head_mask, dim=3, index=argsort_4d)
+			argsort_5d = (
+				argsort.unsqueeze(1)
+				.unsqueeze(1)
+				.unsqueeze(1)
+				.expand(-1, head_mask.size(1), head_mask.size(2), head_mask.size(3), -1)
+			)
+			head_mask = torch.gather(head_mask, dim=4, index=argsort_5d)
+			head_mask = head_mask.permute(1, 0, 2, 3, 4)
+		
+		return hidden_states, position_masks, head_mask
+	
+	def unsort_tokens(self, hidden_states, argsort):
+		argsort = argsort.to(hidden_states.device)
+		reverse_argsort = torch.argsort(argsort, dim=1)
+		reverse_argsort = reverse_argsort.unsqueeze(-1).expand(-1, -1, hidden_states.size(-1))
+		hidden_states = torch.gather(hidden_states, dim=1, index=reverse_argsort)
+		return hidden_states
+	
+	@can_return_tuple
+	def forward(
+		self, 
+		encoder_hidden_states: torch.Tensor,
+		context_mask: list[torch.Tensor],
+		target_mask: list[torch.Tensor],
+		head_mask: Optional[torch.Tensor] = None,
+		output_attentions: bool = False, 
+		output_hidden_states: bool = False,
+		**kwargs,
+	) -> BaseModelOutput:
+		all_hidden_states = () if output_hidden_states else None
+		all_self_attentions = () if output_attentions else None
+
+		# mask out the enccoder hidden states
+		encoder_hidden_states = apply_masks(encoder_hidden_states, context_mask)
+		_, N_ctxt, D = encoder_hidden_states.shape
+		hidden_states, position_masks = self.embeddings(encoder_hidden_states, context_mask, target_mask)
+
+		# Put tokens in sorted order
+		argsort = torch.argsort(position_masks, dim=1) # [B, N]
+		hidden_states, position_masks, head_mask = self.sort_tokens(hidden_states, position_masks, argsort, head_mask)
+
+		for i, layer_module in enumerate(self.layer):
+			if output_hidden_states:
+				all_hidden_states = all_hidden_states + (hidden_states,)
+
+			layer_head_mask = head_mask[i] if head_mask is not None else None
+			layer_outputs = layer_module(hidden_states, position_masks, layer_head_mask, output_attentions)
+			hidden_states = layer_outputs[0]
+
+			if output_attentions:
+				all_self_attentions = all_self_attentions + (layer_outputs[1],)
+
+		if output_hidden_states:
+			all_hidden_states = all_hidden_states + (hidden_states,)
+
+		hidden_states = self.layernorm(hidden_states)
+		# unsort and extract the predicted tokens
+		hidden_states = self.unsort_tokens(hidden_states, argsort)
+		hidden_states = hidden_states[:, N_ctxt]
+		# projection
+		hidden_states = self.proj(hidden_states)
+
+		return BaseModelOutput(
+			last_hidden_state=hidden_states,
+			hidden_states=all_hidden_states,
+			attentions=all_self_attentions,
+		)
+
+class VJEPA2PoolerSelfAttention(nn.Module):
+	# Multi Headed Attention
+
+	def __init__(self, config: VJEPA2Config):
+		super().__init__()
+		self.config = config
+		self.embed_dim = config.hidden_size
+		self.num_heads = config.num_attention_heads
+		self.head_dim = self.embed_dim // self.num_heads
+
+		if self.head_dim * self.num_heads != self.embed_dim:
+			raise ValueError(
+				f"embed_dim must be divisible by num_heads (got `embed_dim`: {self.embed_dim} and `num_heads`:"
+				f" {self.num_heads})."
+			)
+		self.scale = self.head_dim**-0.5
+		self.dropout = config.attention_dropout
+		self.is_causal = False
+
+		self.k_proj = nn.Linear(self.embed_dim, self.embed_dim)
+		self.v_proj = nn.Linear(self.embed_dim, self.embed_dim)
+		self.q_proj = nn.Linear(self.embed_dim, self.embed_dim)
+		self.out_proj = nn.Linear(self.embed_dim, self.embed_dim)
+
+	def forward(
+			self,
+			hidden_states: torch.Tensor,
+			attention_mask: Optional[torch.Tensor] = None,
+			output_attentions: Optional[bool] = False,
+	) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+		# input shape: batch x time x channel
+
+		batch_size, seq_length, embed_dim = hidden_states.shape
+
+		queries = self.q_proj(hidden_states)
+		keys = self.k_proj(hidden_states)
+		values = self.v_proj(hidden_states)
+
+		queries = queries.view(batch_size, seq_length, self.num_heads, self.head_dim).transpose(1, 2)
+		keys = keys.view(batch_size, seq_length, self.num_heads, self.head_dim).transpose(1, 2)
+		values = values.view(batch_size, seq_length, self.num_heads, self.head_dim).transpose(1, 2)
+
+		attention_inferface: Callable = eager_attention_forward
+		if self.config._attn_implementation != "eager":
+			if self.config._attn_implementation == "sdpa" and output_attentions:
+				logger.warning_once(
+					"`torch.nn.funcational.scaled_dot_product_attention` does not support `output_attentions=True`. Falling back to "
+					'eager attention. This warning can be removed using the argument `attn_implementation="eager"` when loading the model.'
+				)
+			else:
+				attention_inferface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
+
+		attn_output, attn_weights = attention_inferface(
+			self, 
+			queries,
+			keys, 
+			values, 
+			attention_mask,
+			is_causal=self.is_causal,
+			scaling=self.scale,
+			dropout=0.0 if not self.training else self.dropout,
+		)
+
+		attn_output = attn_output.reshape(batch_size, seq_length, embed_dim).contiguous()
+		attn_output = self.out_proj(attn_output)
+
+		if not output_attentions:
+			attn_weights = None
+		
+		return attn_output, attn_weights
 
 
 
