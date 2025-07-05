@@ -4,8 +4,10 @@ from typing import Callable, Optional, Union
 import torch
 from torch import nn
 
+from functools import partial
+
 from ...activations import ACT2FN
-from ...modeling_layers import GradientCheckpointingLayer
+# from ...modeling_layers import GradientCheckpointingLayer
 from ...modeling_outputs import BaseModelOutput, ImageClassifierOutput
 from ...modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from ...utils import ModelOutput, auto_docstring, can_return_tuple, logging
@@ -485,9 +487,220 @@ class VJEPA2RopeAttention(nn.Module):
 
 			return outputs
 
+		"""
+		^^^ Attention layer that takes patch embeddings, calculates their 3D positions, 
+		applies Rotary Positional Embeddings to queries adn keys to incorporate spatial 
+		and temporal relationships, performs multi-head scaled dot-product attention, 
+		and the projects the output. Ensures positional awareness crucial for video processing.
+		"""
+# Randomly drops entire "paths" within a newtork during training.
+# Instead of dropping individual neurons, it sets the output of a residual block to zero with a certain probability.
+# Forcing the other blocks to learn more robust features
+def drop_path(input: torch.Tensor, drop_prob: float = 0.0, training: bool = False) -> torch.Tensor:
+
+	if drop_prob == 0.0 or not training:
+		return input
+	keep_prob = 1 - drop_prob
+	shape = (input.shape[0],) + (1,) * (input.ndim - 1) # work with diff dim tensors, not just 2D ConvNets
+	random_tensor = keep_prob + torch.rand(shape, dtype=input.dtype, device=input.device)
+	random_tensor.floor_() # binarize
+	output = input.div(keep_prob) * random_tensor
+	return output
+
+
+# Stochastic Depth regularization -> improvess trainging and generalization
+class VJEPA2DropPath(nn.Module):
+	"""Drop paths (Stochastic Depth) per sample (when applied in main path of residual blocks)."""
+
+	def __init__(self, drop_prob: Optional[float] = None):
+		super().__init__()
+		self.drop_prob = drop_prob
+
+	def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+		return drop_path(hidden_states, self.drop_prob, self.training)
+	
+	def extra_repr(self) -> str:
+		return f"p={self.drop_prob}"
+
 """
-^^^ Attention layer that takes patch embeddings, calculates their 3D positions, 
-applies Rotary Positional Embeddings to queries adn keys to incorporate spatial 
-and temporal relationships, performs multi-head scaled dot-product attention, 
-and the projects the output. Ensures positional awareness crucial for video processing.
+
+Two-layer feed-forward network with an activation funciton in between.
+
 """
+class VJEPA2MLP(nn.Module):
+	def __init__(self, config: VJEPA2Config, hidden_size: int = 1024, mlp_ratio: float = 4.0):
+		super().__init__()
+		in_features = out_features = hidden_size
+		hidden_features = int(hidden_size * mlp_ratio)
+		self.fc1 = nn.Linear(in_features, hidden_features, bias=True)
+		self.activation = ACT2FN[config.hidden_act]
+		self.fc2 = nn.Linear(hidden_features, out_features, bias=True)
+
+	def forward(self, hidden_state: torch.Tensor) -> torch.Tensor:
+		hidden_state = self.fc1(hidden_state)
+		hidden_state = self.activation(hidden_state)
+		hidden_state = self.fc2(hidden_state)
+		return hidden_state
+	
+class GradientCheckpointingLayer(nn.Module):
+
+	gradient_checkingpointing = False
+	
+	def __call__(self, *args, **kwargs):
+		if self.gradient_checkingpointing and self.training:
+			do_warn = False
+			layer_name = self.__class__.__name__
+			message = f"Caching is incompatible with gradient checkpointing in {layer_name}. Setting"
+
+			if "use_cache" in kwargs and kwargs["use_cache"]:
+				kwargs["use_cache"] = False
+				message += " `use_cache=False`,"
+				do_warn = True
+
+			# different names for the same thing in different layers
+			if "past_key_value" in kwargs and kwargs["past_key_value"] is not None:
+				kwargs["past_key_value"] = None
+				message += " `past_key_value=None`, "
+				do_warn = True
+
+			if  "past_key_values" in kwargs and kwargs["past_key_values"] is not None:
+				kwargs["past_key_values"] = None
+				message += " `past_key_values=None`, "
+				do_warn = True
+
+			if "layer_past" in kwargs and kwargs["layer_past"] is not None:
+				kwargs["layer_past"] = None
+				message += " `layer_past=None`, "
+				do_warn = True
+
+			# warn if anything was changed
+			if do_warn:
+				message = message.rstrip(",") + "."
+				logger.warning(message)
+
+			return self._gradient_checkpointing_func(partial(super().__call__, **kwargs), *args)
+		return super().__call__(*args, **kwargs)
+
+# Single Transfroer block within the VJEPA2 model's encoder and predictor.
+# Combines self-attention, normalization, and feed-forward network + residual connections and stochastic depth.
+class VJEPA2Layer(GradientCheckpointingLayer):
+	# Block class
+	def __init__(
+		self, 
+		config: VJEPA2Config,
+		drop_path_rate: float = 0.0,
+		hidden_size: int = 1024, 
+		num_attention_heads: int = 16,
+		mlp_ratio: float = 4.0,
+	):
+		super().__init__()
+		self.config = config
+		self.hidden_size = hidden_size
+		self.num_attention_heads = num_attention_heads
+		self.mlp_ratio = mlp_ratio
+	
+		self.norm1 = nn.LayerNorm(hidden_size, eps=config.layer_norm_eps)
+		self.attention = VJEPA2RopeAttention(config, hidden_size, num_attention_heads)
+		self.drop_path = VJEPA2DropPath(drop_path_rate) if config.drop_path_rate > 0.0 else nn.Identity()
+		self.norm2 = nn.LayerNorm(hidden_size, eps=config.layer_norm_eps)
+		self.mlp = VJEPA2MLP(config, hidden_size=hidden_size, mlp_ratio=mlp_ratio)
+
+	def froward(
+			self, 
+			hidden_states: torch.Tensor,
+			position_mask: Optional[torch.Tensor] = None,
+			head_mask: Optional[torch.Tensor] = None,
+			output_attentions: bool = False,
+	) -> tuple[torch.Tensor, ...]:
+		# Self-Attention
+		residual = hidden_states
+		hidden_states = self.norm1(hidden_states)
+		self_attention_outputs = self.attention(
+			hidden_states,
+			position_mask=position_mask,
+			head_mask=head_mask,
+			output_attentions=output_attentions,
+		)
+		attention_output = self_attention_outputs[0]
+		hidden_states = self.drop_path(attention_output) + residual
+
+		# MLP
+		residual = hidden_states
+		hidden_states = self.norm2(hidden_states)
+		hidden_states = self.mlp(hidden_states)
+		hidden_states = self.drop_path(hidden_states) + residual
+
+		# Add self attention if we output attention weights
+		outputs = self_attention_outputs[1:]
+		outputs = (hidden_states,) + outputs
+
+		return outputs
+
+class VJEPA2Encoder(nn.Module):
+	def __init__(self, config: VJEPA2Config):
+		super().__init__()
+		self.config = config
+
+		self.embeddings = VJEPA2Embeddings(config, hidden_size=config.hidden_size)
+		drop_path_rates = [
+			(config.drop_path_rate * i / (config.num_hidden_layers - 1) if config.num_hidden_layers > 1 else 0.0)
+			for i in range(config.num_hidden_layers)
+		]
+		self.layer = nn.ModuleList(
+			[
+				VJEPA2Layer(
+					config, 
+					drop_path_rate=drop_path_rates[i],
+					hidden_size=config.hidden_size,
+					num_attention_heads=config.num_attention_heads,
+					mlp_ratio=config.mlp_ratio,
+				)
+				for i in range(config.num_hidden_layers)
+			]
+		)
+		self.layernorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norms_eps)
+		self.gradient_checkpointing = False
+
+	@can_return_tuple
+	def forward(
+		self, 
+		pixel_value_videos: Optional[torch.Tensor] = None, 
+		head_mask: Optional[torch.Tensor] = None,
+		output_attentions: bool = False,
+		output_hidden_states: bool = False,
+	) -> BaseModelOutput:
+		all_hidden_states = () if output_hidden_states else None
+		all_self_attentions = () if output_attentions else None
+
+		hidden_states = self.embeddings(pixel_value_videos)
+
+		for i, layer_module in enumerate(self.layer):
+			if output_hidden_states:
+				all_hidden_states = all_hidden_states + (hidden_states,)
+
+			layer_head_mask = head_mask[i] if head_mask is not None else None
+			layer_outputs = layer_module(hidden_states, None, layer_head_mask, output_attentions)
+			hidden_states = layer_outputs[0]
+
+			if output_attentions:
+				all_self_attentions = all_self_attentions + (layer_outputs[1],)
+
+			hidden_states = self.layernorm(hidden_states)
+
+			if output_hidden_states:
+				all_hidden_states = all_hidden_states + (hidden_states,)
+
+			return BaseModelOutput(
+				last_hidden_state=hidden_states,
+				hidden_states=all_hidden_states,
+				attentions=all_self_attentions,
+			)
+			
+
+
+
+
+
+
+	
+	
