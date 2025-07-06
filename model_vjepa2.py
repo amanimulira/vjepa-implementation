@@ -833,12 +833,21 @@ class VJEPA2PredictorEmbeddings(nn.Module):
 
 		return embeddings, masks
 
+"""
+
+Takes (visible) context tokens and the (learnable) mask tokens, processes them through its own transformer layers
+and then predict the full feature representation for the masked tokens.
+
+"""
+
 class VJEPA2Predictor(nn.Module):
 	def __init__(self, config: VJEPA2Config):
 		super().__init__()
 		self.config = config
 		self.gradient_checkpointing = False
+		# Projects encoder outputs, creating mask tokens, and combining them with positional indices.
 		self.embeddings = VJEPA2PredictorEmbeddings(config)
+		# Linearly increaing drop_path_rate for each of the config.pred_num_hidden_layers layers within the predictor.
 		drop_path_rates = [
 			(
 				config.drop_path_rate * i / (config.pred_num_hidden_layers - 1)
@@ -846,7 +855,8 @@ class VJEPA2Predictor(nn.Module):
 				else 0.0
 			)
 			for i in range(config.pred_num_hidden_layers)
-		]
+		] 
+		# Predictor can have a different number of layers, hidden size, and attention heads that the main econder
 		self.layer = nn.ModuleList(
 			[
 				VJEPA2Layer(
@@ -862,17 +872,57 @@ class VJEPA2Predictor(nn.Module):
 		self.layernorm = nn.LayerNorm(config.pred_hidden_size, eps=config.layer_norm_eps)
 		self.proj = nn.Linear(config.pred_hidden_size, config.hidden_size, bias=True)
 
+	# Tokens are rearranged for processing efficiency or to separate visible form masked parts, then put back into their original order.
+	# Takes token embeddigns and corresponding set of masks, reorders the embeddings based on the masks. 
+	# Hence grouping visible tokens together, follwed by masked tokens
 	def sort_tokens(self, hidden_states, position_masks, argsort, head_mask=None):
-		# gather position masks
+		"""
+		
+		gather position masks
+		
+		torch.gather(position_mask, dim=1, index=argsort)
+			reorders position_masks along dim=1, sequence length dim, using argsort indices.
+			position_masks now correspond to the reordered tokens.
+	
+		"""
+
 		argsort = argsort.to(position_masks.device)
 		position_masks = torch.gather(position_masks, dim=1, index=argsort)
 
-		# gather hidden states
+		"""
+
+		gather hidden states
+
+		hidden_states_argsort = argsort.unsqueeze(-1).expand(-1, -1, hidden_states.size(-1))
+			this expands argsort from [batch_size, sequence_length] to [batch_size, sequence_length, embedding_dim]
+			torch.gather requires the index tensor to have the same number of dims as the input tensor
+
+		hidden_states = torch.gather(hidden_states, dim=1, index=hidden_states_argsort)
+			reorders the hidden_states tokens along dim=1 using the expanded argsort.
+
+		"""
 		argsort = argsort.to(hidden_states.device)
 		hidden_states_argsort = argsort.unsqueeze(-1).expand(-1, -1, hidden_states.size(-1))
 		hidden_states = torch.gather(hidden_states, dim=1, index=hidden_states_argsort)
 
-		# gather head mask
+		"""
+		gather head mask
+		
+		head_mask = head_mask.permute(1, 0, 2, 3, 4)
+			head_mask is typically [num_layers, batch_size, num_heads, query_seq_len, key_seq_len], so 
+			permute(1, 0, 2, 3, 4) changes the it to [batch_size, num_layers, query_seq_len, key_seq_len].
+		
+		argsort_4d (dim=3) which is the query_seq_len, this creates an argsort tensor that matches the dimensions of head_mask up to dim=3
+
+			head_mask.size(-1) represents key_seq_len, ensures that when gather is applied alogn dim=3 argsort indices are correctly broadcast 
+			across key_seq_len dim for each [batch, layer, head]
+
+			torch.gather(..., dim=4, ...) reorders head_mask along the query sequence length dim (dim=3)
+
+		then similar logic for argsort_5d
+
+
+		"""
 		if head_mask is not None and head_mask[0] is not None:
 			argsort = argsort.to(head_mask.device)
 			head_mask = head_mask.permute(1, 0, 2, 3, 4)
@@ -1022,9 +1072,178 @@ class VJEPA2PoolerSelfAttention(nn.Module):
 			attn_weights = None
 		
 		return attn_output, attn_weights
+	
+class VJEPA2PoolerCrossAttention(nn.Module):
+	# doesnt have an outptu projection layer
+
+	def __init__(self, config: VJEPA2Config):
+		super().__init__()
+		self.config = config
+		self.embed_dim = config.hidden_size
+		self.num_heads = config.num_attention_heads
+		self.head_dim = self.embed // self.num_heads
+
+		if self.head_dim * self.num_heads != self.embed_dim:
+			raise ValueError(
+				f"embed_dim must be divisible by num_heads (got `embed_dim`: {self.embed_dim} and `num_heads`:"
+				f" {self.num_heads})."
+			)
+		
+		self.scale = self.head_dim**-0.5
+		self.dropout = config.attention_dropout
+		self.is_causal = False
+
+		self.k_proj = nn.Linear(self.embed_dim, self.embed_dim)
+		self.v_proj = nn.Linear(self.embed_dim, self.embed_dim)
+		self.q_proj = nn.Linear(self.embed_dim, self.embed_dim)
+
+	def forward(
+			self, 
+			queries: torch.Tensor,
+			keys: torch.Tensor,
+			values: torch.Tensor,
+			attention_mask: Optional[torch.Tensor] = None,
+			output_attentions: Optional[bool] = False,
+	) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+		# Input shape: batch x time x channel
+
+		batch_size, q_seq_length, embed_dim = queries.shape
+		kv_seq_length = keys.shape[1]
+
+		queries = self.q_proj(queries)
+		keys = self.k_proj(keys)
+		values = self.v_proj(values)
+		
+		queries = queries.view(batch_size, q_seq_length, self.num_heads, self.head_dim).transpose(1, 2)
+		keys = keys.view(batch_size, kv_seq_length, self.num_heads, self.head_dim).transpose(1, 2)
+		values = values.view(batch_size, kv_seq_length, self.num_heads, self.head_dim).transpose(1, 2)
+
+		attention_inferface: Callable = eager_attention_forward
+		if self.config._attn_implementation != "eager":
+			if self.config._attn_implementation == "sdpa" and output_attentions:
+				logger.warning_once(
+					"`torch.nn.funcation.scaled_dot_product_attention` does not support `outputs_attentions=True`. Falling back to "
+					'eager attention. This warning can be removed using the argument `attn_implementation="eager"` when loading the model.'
+				)
+			else: 
+				attention_inference = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
+
+			attn_output, attn_weights = attention_inferface(
+				self, 
+				queries, 
+				keys, 
+				values, 
+				attention_mask,
+				is_causal=self.is_causal,
+				scaling=self.scales, 
+				dropout=0.0 if not self.training else self.dropout,
+			)
+
+			attn_output = attn_output.reshape(batch_size, q_seq_length, embed_dim).contiguous()
+
+			if not output_attentions:
+				attn_wegihts = None
+			
+			return attn_output, attn_weights
 
 
 
+class VJEPA2PoolerSelfAttentionLayer(GradientCheckpointingLayer):
+	def __init__(self, config: VJEPA2Config):
+		super().__init__()
+		self.layer_norm1 = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+		self.self_attn = VJEPA2PoolerSelfAttention(config)
+		self.layer_norm2 = nn.layerNorm(config.hidden_size, eps=config.layer_norm_eps)
+		self.mlp = VJEPA2MLP(config, hidden_size=config.hidden_size)
+
+	def forward(
+			self, 
+			hidden_states: torch.Tensor,
+			attention_mask: torch.Tensor,
+			output_attentions: Optional[bool] = False,
+	) -> tuple[torch.Tensor, ...]:
+		
+		residual = hidden_states
+		hidden_states = self.layer_norm1(hidden_states)
+		hidden_states, attn_weights = self.self_attn(
+			hidden_states=hidden_states,
+			attention_mask=attention_mask,
+			output_attentions=output_attentions,
+		)
+		hidden_states = residual + hidden_states
+
+		residual = hidden_states
+		hidden_states = self.layer_norm2(hidden_states)
+		hidden_states = self.mlp(hidden_states)
+		hidden_states = residual + hidden_states
+
+		outputs = (hidden_states,)
+
+		if output_attentions:
+			outputs += (attn_weights,)
+
+		return outputs
+
+class VJEPA2PoolerCrossAttentionLayer(GradientCheckpointingLayer):
+	def __init__(self, config: VJEPA2Config):
+		super().__init__()
+		self.layer_norm1 = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+		self.cross_attn = VJEPA2PoolerCrossAttention(config)
+		self.layer_norm2 = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+		self.mlp = VJEPA2MLP(config, hidden_size=config.hidden_size)
+
+	def forward(
+			self, 
+			queries: torch.Tensor,
+			hidden_state: torch.Tenosr,
+			attention_mask: Optional[torch.Tensor] = None, 
+			output_attentions: bool = False,
+	) -> tuple[torch.Tensor, ...]:
+		# Apply cross-attention
+		residual = queries
+		hidden_state = self.layer_norm1(hidden_state)
+		hidden_state, *attn_weights = self.cross_attn(
+			queries,
+			hidden_state,
+			hidden_state,
+			attention_mask=attention_mask,
+			output_attentions=output_attentions,
+		)
+		hidden_state = residual + hidden_state
+
+		# Apply MLP
+		residual = hidden_state
+		hidden_state = self.layer_norm1(hidden_state)
+		hidden_state = self.mlp(hidden_state)
+		hidden_state = residual + hidden_state
+
+		outputs = (hidden_state,)
+		if output_attentions:
+			outputs += tuple(attn_weights)
+
+		return outputs
+
+class VJEPA2AttentivePooler(nn.Module):
+	# Attentive Pooler
+
+	def __init__(self, config: VJEPA2Config):
+		super().__init__()
+		self.query_tokens = nn.Parameter(torch.zeros(1, 1, config.hidden_size))
+		self.cross_attention_layer = VJEPA2PoolerCrossAttentionLayer(config)
+		self.self_attention_layers = nn.ModuleList(
+			[VJEPA2PoolerSelfAttentionLayer(config) for _ in range(config.num_pooler_layers)]
+		)
+
+	def forward(self, hidden_state: torch.Tensor) -> torch.Tensor:
+		for layer in self.self_attention_layers:
+			hidden_state = layer(hidden_state, attention_mask=None)[0]
+		queries = self.query_tokens.repeat(hidden_state.shape[0], 1, 1)
+		hidden_state = self.cross_attention_layer(queries, hidden_state)[0]
+		return hidden_state.squeeze(1)
+	
+@auto_docstring
+class VJEPA2PreTrainedModel(PreTrainedModel):
+	
 
 
 
