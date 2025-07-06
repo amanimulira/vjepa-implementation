@@ -30,7 +30,7 @@ hidden states at various layers and attention weights.
 	VJEPA Predictor outputs that also contains the masked encoder outputs
 	"""
 )
-class VJEPAWithMasksedInputPredictorOutput(ModelOutput):
+class VJEPA2WithMaskedInputPredictorOutput(ModelOutput):
 	r"""
 	masked_hidden_state (`torch.FloatTensor` of shape `(batch_size, sequence_length, hidden_size)`, *optional*, returned when `context_mask` is provided which is applied on VJEPAEncoder outputs):
 		The masked hidden state of the model.
@@ -53,7 +53,7 @@ class VJEPAWithMasksedInputPredictorOutput(ModelOutput):
 	Optionally contains the predictor outputs
 	"""
 )
-class VJEPAWithMaskedInputModelOutput(ModelOutput):
+class VJEPA2WithMaskedInputModelOutput(ModelOutput):
 	r"""
 	masked_hidden_state (`torch.FloatTensor` of shape `(batch_size, sequence_length, hidden_size)`, *optional*, returned when `context_mask` is provided which is applied on VJEPA2Encoder outputs):
 		The masked hidden state of the model.
@@ -1243,8 +1243,209 @@ class VJEPA2AttentivePooler(nn.Module):
 	
 @auto_docstring
 class VJEPA2PreTrainedModel(PreTrainedModel):
-	
+	config_class = VJEPA2Config
+	base_model_prefix = "vjepa2"
+	main_input_name = "pixel_values_videos"
+	supports_gradient_checkpointing = True
+	_no_split_modules = [
+		"VJEPA2Layer",
+		"VJEPA2PoolerSelfAttentionLayer",
+		"VJEPA2PoolerCrossAttentionLayer",
+		"VJEPA2PredictorEmbeddings",
+	]
+	_supports_sdpa = True
+	_supports_flash_attn_2 = True
 
+	def _init_weights(self, module):
+		""" Initialize the weights """
+
+		init_std = self.config.initializer_range
+
+		# Upcast the input in `fp32` and cast it back to desired `dtype` to avoid
+		# `trunc_normal_cpu` not implemented in `half` issues
+		def trunc_normal_f32_(weight, std):
+			data_float_32 = weight.data.to(torch.float32)
+			data_init = nn.init.trunc_normal_(data_float_32, mean=0.0, std=std)
+			weight.data = data_init.to(weight.dtype)
+
+		if isinstance(module, VJEPA2AttentivePooler):
+			trunc_normal_f32_(module.query_tokens, std=init_std)
+			for i, layer in enumerate(module.self_attention_layers, 1):
+				std = init_std / (i**0.5)
+				trunc_normal_f32_(layer.self_attn.out_proj.weight, std=std)
+				trunc_normal_f32_(layer.mlp.fc2.wegiht, std=std)
+			std = init_std / (len(module.self_attention_layers) + 1) ** 0.5
+			trunc_normal_f32_(module.cross_attention_layer.mlp.fc2.weight, std=std)
+		elif isinstance(module, VJEPA2PredictorEmbeddings):
+			if module.zero_init_mask_tokens:
+				module.mask_tokens.data.zero_()
+			else:
+				trunc_normal_f32_(module.mask_tokens, std=init_std)
+		elif isinstance(module, (nn.Linear, nn.Conv2d, nn.Conv3d)):
+			trunc_normal_f32_(module.weight, std=init_std)
+			if module.bias is not None:
+				module.bias.data.zero_()
+		elif isinstance(module, nn.LayerNorm):
+			module.bias.data.zero_()
+			module.weight.data.fill_(1.0)
+
+def _convert_head_mask_to_5d(head_mask, num_hidden_layers):
+	"""
+	input:
+		head_mask: bsz x seq_length x seq_length | None
+	return:
+		[num_hidden_layers x batch x num_heads x seq_length x seq_length] | [num_hidden_layers]
+	"""
+	if head_mask is not None:
+		head_mask = head_mask.unsqueeze(1).unsqueeze(0)
+		head_mask = head_mask.expand(num_hidden_layers, -1, -1, -1, -1)
+	else:
+		head_mask = [None] * num_hidden_layers
+	return head_mask
+
+@auto_docstring
+class VJEPA2Model(VJEPA2PreTrainedModel):
+	def __init__(self, config: VJEPA2Config):
+		super().__init__(config)
+		self.config = config
+
+		self.encoder = VJEPA2Encoder(config)
+		self.predictor = VJEPA2Predictor(config)
+
+		# initialize weights and apply final processing
+		self.post_init()
+
+	def get_input_embeddings(self) -> VJEPA2PatchEmbeddings3D:
+		return self.encoder.embeddings.patch_embeddings
+	
+	@can_return_tuple
+	@auto_docstring
+	def forward(
+		self, 
+		pixel_values_videos: torch.Tensor,
+		context_head_mask: Optional[torch.Tensor] = None,
+		context_mask: Optional[list[torch.Tensor]] = None,
+		target_head_mask: Optional[list[torch.Tensor]] = None,
+		target_mask: Optional[list[torch.Tensor]] = None,
+		skip_predictor: bool = False,
+		output_attentions: Optional[bool] = None,
+		output_hidden_states: Optional[bool] = None,
+		**kwargs,
+	) -> VJEPA2WithMaskedInputModelOutput:
+		
+		output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+		output_hidden_states = (
+			output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+		)
+
+		if pixel_values_videos is None:
+			raise ValueError("You have to specify pixel_values_videos")
+		
+		# Prepares head mask if needed
+		context_head_mask = _convert_head_mask_to_5d(context_head_mask, self.config.num_hidden_layers)
+		target_head_mask = _convert_head_mask_to_5d(target_head_mask, self.config.pred_num_hidden_layers)
+
+		encoder_outputs: BaseModelOutput = self.encoder(
+			pixel_values_videos=pixel_values_videos,
+			head_mask=context_head_mask,
+			output_attentions=output_attentions,
+			output_hidden_states=output_hidden_states,
+		)
+		sequence_output = encoder_outputs.last_hidden_state
+
+		if context_mask is None and target_mask is None:
+			B = pixel_values_videos.size(0)
+			N = sequence_output.size(1)
+			context_mask = [torch.arange(N, device=pixel_values_videos.device).unsqueeze(0).repeat((B, 1))]
+			target_mask = [torch.arange(N, device=pixel_values_videos.device).unsqueeze(0).repeat((B, 1))]
+
+		if not skip_predictor:
+			predictor_outputs: BaseModelOutput = self.predictor(
+				encoder_hidden_states=sequence_output,
+				context_mask=context_mask,
+				target_mask=target_mask,
+				head_mask=target_head_mask,
+				output_attentions=output_attentions,
+				output_hidden_states=output_hidden_states,
+			)
+			predictor_output = VJEPA2WithMaskedInputPredictorOutput(
+				last_hidden_state=sequence_output,
+				masked_hidden_state=apply_masks(sequence_output, context_mask),
+				hidden_states=predictor_output.hidden_states,
+				attnetions=predictor_output.attentions,
+			)
+		else:
+			predictor_output = None
+
+		encoder_output = VJEPA2WithMaskedInputModelOutput(
+			last_hidden_state=sequence_output,
+			masked_hidden_state=apply_masks(sequence_output, context_mask),
+			hidden_states=encoder_outputs.hidden_states,
+			attentions=encoder_outputs.attentions,
+			predictor_output=predictor_output,
+		)
+
+		return encoder_output
+		
+	def get_vision_features(self, pixel_values_videos) -> torch.Tensor:
+		encoder_output = self.forward(pixel_values_videos)
+		return encoder_output.last_hidden_state
+
+@auto_docstring(
+	custom_intro="""
+	V-JEPA 2 Model transformer with a video classification head on top (a linear layer on top of the attentive pooler).
+"""
+)
+class VJEPA2ForVideoClassification(VJEPA2PreTrainedModel):
+	def __init__(self, config: VJEPA2Config):
+		super().__init__(config)
+
+		self.num_labels = config.num_labels
+		self.vjepa2 = VJEPA2Model(config)
+
+		# Classifier head
+		self.pooler = VJEPA2AttentivePooler(config)
+		self.classifier = nn.Linear(config.hidden_size, config.num_labels, bias=True)
+
+		# Initialize weights and apply final processing 
+		self.post_init()
+
+	@can_return_tuple
+	@auto_docstring
+	def forward(
+		self, 
+		pixel_values_videos: torch.Tensor,
+		labels: Optional[torch.Tensor] = None,
+		output_attentions: Optional[bool] = None,
+		output_hidden_states: Optional[bool] = None,
+	) -> Union[tuple, ImageClassifierOutput]:
+		
+		outputs = self.vjepa2(
+			pixel_values_videos=pixel_values_videos,
+			skip_predictor=True, 
+			output_attentions=output_attentions,
+			output_hidden_states=output_hidden_states,
+		)
+
+		last_hidden_state = outputs.last_hidden_state
+		pooler_output = self.pooler(last_hidden_state)
+		logits = self.classifier(pooler_output)
+
+		loss = None
+		if labels is not None:
+			loss = self.loss_function(pooled_logits=logits, labels=labels, config=self.config)
+
+		return ImageClassifierOutput(
+			loss=loss,
+			logits=logits,
+			hidden_states=outputs.hidden_states,
+			attentions=outputs.attentions,
+		)
+	
+__all__ = ["VJEPA2Model", "VJEPA2PreTrainedModel", "VJEPA2ForVideoClassification"]
+
+
+		
 
 
 	
