@@ -6,12 +6,12 @@ from torch import nn
 
 from functools import partial
 
-from ...activations import ACT2FN
-# from ...modeling_layers import GradientCheckpointingLayer
-from ...modeling_outputs import BaseModelOutput, ImageClassifierOutput
-from ...modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
-from ...utils import ModelOutput, auto_docstring, can_return_tuple, logging
-from .configuration_vjepa2 import VJEPA2Config
+from activations import ACT2FN
+from modeling_layers import GradientCheckpointingLayer
+from modeling_outputs import BaseModelOutput, ImageClassifierOutput
+from modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
+from utils import ModelOutput, auto_docstring, can_return_tuple, logging
+from configuration_vjepa2 import VJEPA2Config
 
 logger = logging.get_logger(__name__)
 
@@ -96,7 +96,7 @@ class VJEPA2PatchEmbeddings3D(nn.Module):
 
 		# Core of patch embedding.
 		self.proj = nn.Conv3d(
-			in_chanenls=config.in_chans,
+			in_channels=config.in_chans,
 			out_channels=hidden_size,
 			kernel_size=(config.tubelet_size, config.patch_size, config.patch_size),
 			stride=(config.tubelet_size, config.patch_size, config.patch_size)
@@ -217,7 +217,7 @@ def eager_attention_forward(
 
 	# This is actually dropping out entire tokens to attend to, which might
 	# seem a bit unusal, byt is taken from the original Transformer paper.
-	attn_weights = nn.functional.dropout(attn_weights, p=dropout, trainig=module.training)
+	attn_weights = nn.functional.dropout(attn_weights, p=dropout, training=module.training)
 
 	# Mask heads if we want...
 	# Applied to the attention weights: where prevents attention to those positions.
@@ -286,7 +286,7 @@ def rotate_queries_or_keys(x, pos):
 
 	"""
 	y = x.unflatten(-1, (-1, 2))
-	y1, y2 =y.unbid(dim=-1)
+	y1, y2 =y.unbind(dim=-1)
 
 	y = torch.stack((-y2, y1), dim=-1)
 	y = y.flatten(-2)
@@ -541,45 +541,6 @@ class VJEPA2MLP(nn.Module):
 		hidden_state = self.activation(hidden_state)
 		hidden_state = self.fc2(hidden_state)
 		return hidden_state
-	
-class GradientCheckpointingLayer(nn.Module):
-
-	gradient_checkingpointing = False
-	
-	def __call__(self, *args, **kwargs):
-		if self.gradient_checkingpointing and self.training:
-			do_warn = False
-			layer_name = self.__class__.__name__
-			message = f"Caching is incompatible with gradient checkpointing in {layer_name}. Setting"
-
-			if "use_cache" in kwargs and kwargs["use_cache"]:
-				kwargs["use_cache"] = False
-				message += " `use_cache=False`,"
-				do_warn = True
-
-			# different names for the same thing in different layers
-			if "past_key_value" in kwargs and kwargs["past_key_value"] is not None:
-				kwargs["past_key_value"] = None
-				message += " `past_key_value=None`, "
-				do_warn = True
-
-			if  "past_key_values" in kwargs and kwargs["past_key_values"] is not None:
-				kwargs["past_key_values"] = None
-				message += " `past_key_values=None`, "
-				do_warn = True
-
-			if "layer_past" in kwargs and kwargs["layer_past"] is not None:
-				kwargs["layer_past"] = None
-				message += " `layer_past=None`, "
-				do_warn = True
-
-			# warn if anything was changed
-			if do_warn:
-				message = message.rstrip(",") + "."
-				logger.warning(message)
-
-			return self._gradient_checkpointing_func(partial(super().__call__, **kwargs), *args)
-		return super().__call__(*args, **kwargs)
 
 # Single Transfroer block within the VJEPA2 model's encoder and predictor.
 # Combines self-attention, normalization, and feed-forward network + residual connections and stochastic depth.
@@ -605,7 +566,7 @@ class VJEPA2Layer(GradientCheckpointingLayer):
 		self.norm2 = nn.LayerNorm(hidden_size, eps=config.layer_norm_eps)
 		self.mlp = VJEPA2MLP(config, hidden_size=hidden_size, mlp_ratio=mlp_ratio)
 
-	def froward(
+	def forward(
 			self, 
 			hidden_states: torch.Tensor,
 			position_mask: Optional[torch.Tensor] = None,
@@ -662,7 +623,7 @@ class VJEPA2Encoder(nn.Module):
 				for i in range(config.num_hidden_layers)
 			]
 		)
-		self.layernorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norms_eps)
+		self.layernorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
 		self.gradient_checkpointing = False
 	# Can return either a ModelOutput object or plain tuple
 	@can_return_tuple
@@ -1443,10 +1404,3 @@ class VJEPA2ForVideoClassification(VJEPA2PreTrainedModel):
 		)
 	
 __all__ = ["VJEPA2Model", "VJEPA2PreTrainedModel", "VJEPA2ForVideoClassification"]
-
-
-		
-
-
-	
-	
